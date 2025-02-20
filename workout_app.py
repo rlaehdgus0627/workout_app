@@ -102,9 +102,9 @@ class Exercise:
         return ex
 
 class Routine:
-    def __init__(self, name, exercises):
+    def __init__(self, name, exercises=None):
         self.name = name
-        self.exercises = []
+        self.exercises = exercises if exercises is not None else []
 
     def add_exercise(self, exercise):
         self.exercises.append(exercise)
@@ -114,6 +114,13 @@ class Routine:
             'name': self.name,
             'exercises': [ex.to_dict() for ex in self.exercises]
         }
+
+    @staticmethod
+    def from_dict(data):
+        routine = Routine(data["name"], [])
+        for ex_data in data.get("exercises", []):
+            routine.add_exercise(Exercise.from_dict(ex_data))
+        return routine
 
 # -------------------------------
 # 파일 입출력 함수들
@@ -371,6 +378,7 @@ class WorkoutSessionWindow(tk.Toplevel):
             "exercises": []
         }
         self.current_exercise_sets = []
+        self.timer_window = None  # 현재 실행 중인 타이머 창 참조
 
         self.build_widgets()
         self.display_current_exercise()
@@ -383,13 +391,7 @@ class WorkoutSessionWindow(tk.Toplevel):
         self.content_frame = ttk.Frame(self)
         self.content_frame.pack(expand=True, fill="both", pady=10)
 
-        # 운동 날짜 설정 입력란
-        self.date_frame = ttk.Frame(self.content_frame)
-        self.date_frame.pack(pady=5)
-        ttk.Label(self.date_frame, text="운동 날짜 (YYYY-MM-DD):").pack(side="left", padx=5)
-        self.date_entry = ttk.Entry(self.date_frame, width=15)
-        self.date_entry.pack(side="left", padx=5)
-        self.date_entry.insert(0, datetime.date.today().isoformat())
+        # 날짜 입력 부분은 제거 (세션 시작 시 이미 날짜 선택 완료)
 
         self.exercise_info_label = ttk.Label(self.content_frame, text="", font=("Arial", 14))
         self.exercise_info_label.pack(pady=5)
@@ -421,6 +423,8 @@ class WorkoutSessionWindow(tk.Toplevel):
         btn_frame.pack(pady=5)
         btn_add_set = ttk.Button(btn_frame, text="세트 추가", command=self.add_set)
         btn_add_set.pack(side="left", padx=5)
+        btn_delete_set = ttk.Button(btn_frame, text="세트 삭제", command=self.delete_set)
+        btn_delete_set.pack(side="left", padx=5)
         btn_manual_timer = ttk.Button(btn_frame, text="타이머 실행", command=lambda: self.run_timer(self.get_timer_time()))
         btn_manual_timer.pack(side="left", padx=5)
 
@@ -461,6 +465,11 @@ class WorkoutSessionWindow(tk.Toplevel):
         return "60"
 
     def display_current_exercise(self):
+        # 이전 타이머가 있다면 종료
+        if self.timer_window is not None and self.timer_window.winfo_exists():
+            self.timer_window.destroy()
+            self.timer_window = None
+
         if self.current_exercise_index < len(self.routine.exercises):
             exercise = self.routine.exercises[self.current_exercise_index]
             info = f"운동: {exercise.name}"
@@ -526,13 +535,34 @@ class WorkoutSessionWindow(tk.Toplevel):
         self.weight_entry.delete(0, tk.END)
         self.reps_entry.delete(0, tk.END)
         self.rir_entry.delete(0, tk.END)
+        # 세트를 추가하면 기존 타이머가 있다면 종료하고, 새 타이머를 실행
+        if self.timer_window is not None and self.timer_window.winfo_exists():
+            self.timer_window.destroy()
+            self.timer_window = None
         self.run_timer(self.get_timer_time())
+
+    def delete_set(self):
+        selection = self.sets_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("정보", "삭제할 세트를 선택하세요.")
+            return
+        index = selection[0]
+        removed_set = self.current_exercise_sets.pop(index)
+        self.sets_listbox.delete(index)
+        exercise = self.routine.exercises[self.current_exercise_index]
+        muscle = exercise.muscle_group
+        self.session_log["muscle_volumes"][muscle] -= removed_set.weight * removed_set.reps
+        self.session_log["sets_count"][muscle] -= 1
 
     def run_timer(self, seconds=None):
         if seconds is None:
             seconds = simpledialog.askinteger("타이머", "타이머 시간을 초 단위로 입력하세요:", minvalue=1)
+        # 만약 이미 타이머가 있다면 강제로 종료하고 새 타이머 시작
+        if self.timer_window is not None and self.timer_window.winfo_exists():
+            self.timer_window.destroy()
+            self.timer_window = None
         if seconds:
-            TimerWindow(self, seconds)
+            self.timer_window = TimerWindow(self, seconds)
 
     def record_current_exercise(self):
         if self.current_exercise_sets:
@@ -546,6 +576,11 @@ class WorkoutSessionWindow(tk.Toplevel):
             self.session_log["exercises"].append(exercise_log)
 
     def next_exercise(self):
+        # 타이머 창이 있으면 종료합니다.
+        if self.timer_window is not None and self.timer_window.winfo_exists():
+            self.timer_window.destroy()
+            self.timer_window = None
+
         if not self.current_exercise_sets:
             if not messagebox.askyesno("확인", "현재 운동에 입력한 세트가 없습니다. 다음 운동으로 넘어가시겠습니까?"):
                 return
@@ -574,7 +609,6 @@ class WorkoutSessionWindow(tk.Toplevel):
     def compare_with_previous(self):
         logs = load_workout_logs()
         routine_name = self.session_log["routine_name"]
-        # 현재 세션이 로그의 마지막에 있다면 제외
         if logs and logs[-1] == self.session_log:
             logs = logs[:-1]
         previous_log = None
@@ -594,7 +628,13 @@ class WorkoutSessionWindow(tk.Toplevel):
                     continue
                 prev = prev_volumes.get(mg, 0)
                 diff = current - prev
-                info += f"{mg}: 현재 볼륨 = {current}, 이전 볼륨 = {prev}, 차이 = {diff}\n"
+                if current > prev:
+                    trend = "증가"
+                elif current < prev:
+                    trend = "감소"
+                else:
+                    trend = "동일"
+                info += f"{mg}: 현재 볼륨 = {current}, 이전 볼륨 = {prev}, 차이 = {diff} ({trend})\n"
         else:
             info += "비교할 이전 세션이 없습니다."
         messagebox.showinfo("비교 결과", info)
@@ -705,6 +745,7 @@ class NutritionRestRecordFrame(ttk.Frame):
         top_frame = ttk.Frame(self)
         top_frame.pack(pady=5, padx=10, anchor="w")
         ttk.Label(top_frame, text="날짜:").grid(row=0, column=0, padx=5, pady=2)
+        # self.date_entry는 SimpleDateEntry이므로 get_date()로 호출합니다.
         self.date_entry = SimpleDateEntry(top_frame, date_pattern='yyyy-mm-dd')
         self.date_entry.grid(row=0, column=1, padx=5, pady=2)
 
@@ -828,7 +869,7 @@ class NutritionRestRecordFrame(ttk.Frame):
 
     def save_record(self):
         record = {
-            "date": self.date_entry.get(),
+            "date": self.date_entry.get_date().isoformat(),
             "calories": self.calorie_entry.get(),
             "carbs": self.carb_entry.get(),
             "protein": self.protein_entry.get(),
@@ -886,7 +927,6 @@ class BodybuildingApp(tk.Tk):
             messagebox.showinfo("정보", "로그 데이터가 없습니다.")
             return
 
-        # 선택된 부위만 추출
         selected_mg = self.muscle_group_var.get()
         data_by_date = {}
         for log in logs:
